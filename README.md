@@ -24,6 +24,10 @@ Implementation hardware:
 - Mini oscilloscope
 
 
+Publications:
+- [Implicit Solver for Embedded Real-Time Simulation of Nonlinear ECG Dynamics](
+https://ieeexplore.ieee.org/abstract/document/11642369/) --> 2026 International Seminar on Intelligent Technology and Its Applications (ISITIA)
+
 ---
 
 Current implementations:
