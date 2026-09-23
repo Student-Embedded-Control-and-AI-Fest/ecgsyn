@@ -5,8 +5,6 @@
 /* ------------------------------------------------------------
  * Select one solver
  * ------------------------------------------------------------ */
-#define RD_SOLVER_TUSTIN   1
-/* #define RD_SOLVER_RK4   1 */
 
 #if defined(RD_SOLVER_TUSTIN) && defined(RD_SOLVER_RK4)
 #error "Select only one RD solver"

@@ -7,6 +7,9 @@
 extern "C" {
 #endif
 
+#define RD_SOLVER_TUSTIN 1
+//#define RD_SOLVER_RK4 1
+
 typedef struct {
     float ecg_fs;
     float internal_fs;

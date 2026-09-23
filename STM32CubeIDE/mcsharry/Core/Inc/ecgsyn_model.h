@@ -1,22 +1,6 @@
 #ifndef ECGSYN_MODEL_H
 #define ECGSYN_MODEL_H
 
-/*
- * ecgsyn_model.h
- *
- * Program description:
- * This module implements the McSharry synthetic ECG model for embedded
- * waveform generation. The model is used to generate ECG samples with
- * configurable heart-rate variability and PQRST morphology.
- *
- * The state equations can be solved using either:
- * - RK4 (4th-order Runge-Kutta)
- * - Implicit Tustin
- *
- * The generated output is returned in millivolts, so it can be used
- * directly for analysis, visualization, or DAC-based signal playback.
- */
-
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -27,6 +11,9 @@ extern "C" {
 #ifndef PI_D
 #define PI_D 3.1415926535897932384626433832795
 #endif
+
+//#define USE_TUSTIN
+#define USE_RK4
 
 typedef struct {
     int   ecg_fs;
@@ -54,6 +41,7 @@ typedef struct {
 
     float *rr;
     float *rrpc;
+    int   rrpc_len;
 
     float ti[6];
     float ai[6];
@@ -63,11 +51,17 @@ typedef struct {
 void ecgsyn_init_default_params(EcgSynParams *p);
 void ecgsyn_init_context(EcgSynContext *ctx);
 
-bool build_block_mv(const EcgSynParams *p, float **out_mv, int *out_len, EcgSynContext *ctx);
-void free_context(EcgSynContext *ctx);
+bool build_block_mv(
+    const EcgSynParams *p,
+    float **out_mv,
+    int *out_len,
+    EcgSynContext *ctx,
+    float *x_end,
+    float *y_end,
+    float *z_end);
 
-// Helpers for implicit Tustin ECGSYN
-static inline bool implicit_tustin_step(float y[], float t0, float h, float yout[]);
+void free_context(EcgSynContext *ctx);
+bool implicit_tustin_step(float y[], float t0, float h, float yout[]);
 
 #ifdef __cplusplus
 }

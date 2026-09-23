@@ -1,5 +1,8 @@
-../Core/Src/main.c:227:13:oled_show_error	1
-../Core/Src/main.c:158:17:read_adc_channel	5
-../Core/Src/main.c:358:6:SystemClock_Config	4
-../Core/Src/main.c:243:5:main	24
-../Core/Src/main.c:510:6:Error_Handler	1
+../Core/Src/main.c:243:13:oled_show_error	1
+../Core/Src/main.c:204:13:oled_show_build_info	1
+../Core/Src/main.c:172:17:read_adc_channel	5
+../Core/Src/main.c:141:13:build_block_into_buffer.constprop	9
+../Core/Src/main.c:253:6:HAL_TIM_PeriodElapsedCallback	7
+../Core/Src/main.c:444:6:SystemClock_Config	4
+../Core/Src/main.c:294:5:main	27
+../Core/Src/main.c:633:6:Error_Handler	1

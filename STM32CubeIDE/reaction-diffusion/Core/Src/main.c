@@ -39,11 +39,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define RD_GAIN_MV_PER_MV   (1200.0f)
-#define RD_OFFSET_MV        (1700.0f)
-#define VDDA_MV             (3300.0f)
-#define DAC_BITS            (12)
-#define DAC_MAX             ((1U << DAC_BITS) - 1U)
+#define RD_GAIN_MV_PER_MV      (1200.0f)
+#define RD_OFFSET_MV           (1700.0f)
+#define VDDA_MV                (3300.0f)
+#define DAC_BITS               (12)
+#define DAC_MAX                ((1U << DAC_BITS) - 1U)
+#define RD_BLOCK_MAX_SAMPLES   8192
+
+#if defined(RD_SOLVER_RK4)
+  #define RD_METHOD_STR "RK4"
+#elif defined(RD_SOLVER_TUSTIN)
+  #define RD_METHOD_STR "TUS"
+#else
+  #define RD_METHOD_STR "???"
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,23 +64,39 @@
 ADC_HandleTypeDef hadc1;
 DAC_HandleTypeDef hdac1;
 I2C_HandleTypeDef hi2c1;
+TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN PV */
 static RDParams params;
 static RDContext rdCtx;
 
-static uint16_t *dacBuf = NULL;
-static int dacLen = 0;
-static int playIndex = 0;
-static uint16_t refDacCode = 0;
+/* two buffers */
+static uint16_t *bufA = NULL;
+static uint16_t *bufB = NULL;
 
-static uint32_t last_sample_us = 0;
+/* playback side: ISR-owned */
+static uint16_t * volatile playBuf = NULL;
+static volatile int playLen = 0;
+static volatile int playIndex = 0;
+
+/* build side: main-loop-owned */
+static uint16_t *buildBuf = NULL;
+static int buildLen = 0;
+
+/* flags */
+static volatile bool block_wrap_flag = false;
+static volatile bool build_request_flag = false;
+static volatile bool swap_pending = false;
+static volatile bool underrun_flag = false;
+
+static uint16_t refDacCode = 0;
 
 static int last_adc_sig = 0;
 static int last_adc_ref = 0;
 static int last_adc_diff = 0;
 
 static uint32_t build_time_ms = 0;
+static uint32_t blocks_built = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -80,43 +105,24 @@ static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM6_Init(void);
 
 /* USER CODE BEGIN PFP */
 static uint16_t rd_mv_to_dac(float mv);
-static bool build_dac_block(void);
+static bool build_block_into_buffer(uint16_t *dst, int max_len, int *out_len);
 static uint16_t read_adc_channel(uint32_t channel);
 static void oled_show_build_info(void);
 static void oled_show_error(const char *msg);
-
-static void dwt_delay_init(void);
-static uint32_t micros_dwt(void);
 static const char* rd_solver_name(void);
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void dwt_delay_init(void)
-{
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-  DWT->CYCCNT = 0;
-}
-
-static uint32_t micros_dwt(void)
-{
-  return (uint32_t)(DWT->CYCCNT / (SystemCoreClock / 1000000UL));
-}
-
 static const char* rd_solver_name(void)
 {
-#if defined(RD_SOLVER_RK4)
-  return "RD RK4";
-#elif defined(RD_SOLVER_TUSTIN)
-  return "RD Tustin";
-#else
-  return "RD ?";
-#endif
+  return RD_METHOD_STR;
 }
 
 static uint16_t rd_mv_to_dac(float mv)
@@ -132,25 +138,33 @@ static uint16_t rd_mv_to_dac(float mv)
   return (uint16_t)code;
 }
 
-static bool build_dac_block(void)
+static bool build_block_into_buffer(uint16_t *dst, int max_len, int *out_len)
 {
   float *rdBlockMv = NULL;
-  dacLen = 0;
+  int len = 0;
 
-  if (!build_rd_block_mv(&params, &rdBlockMv, &dacLen, &rdCtx)) {
+  if ((dst == NULL) || (out_len == NULL)) {
     return false;
   }
 
-  dacBuf = (uint16_t*)malloc((size_t)dacLen * sizeof(uint16_t));
-  if (!dacBuf) {
+  if (!build_rd_block_mv(&params, &rdBlockMv, &len, &rdCtx)) {
+    return false;
+  }
+
+  if ((len <= 0) || (len > max_len)) {
     if (rdBlockMv) free(rdBlockMv);
     return false;
   }
 
-  for (int i = 0; i < dacLen; i++) {
-    dacBuf[i] = rd_mv_to_dac(rdBlockMv[i]);
+  for (int i = 0; i < len; i++) {
+    if (!isfinite(rdBlockMv[i])) {
+      free(rdBlockMv);
+      return false;
+    }
+    dst[i] = rd_mv_to_dac(rdBlockMv[i]);
   }
 
+  *out_len = len;
   free(rdBlockMv);
   return true;
 }
@@ -214,11 +228,13 @@ static void oled_show_build_info(void)
   ssd1306_WriteString(line, Font_7x10, White);
 
   ssd1306_SetCursor(0, 32);
-  snprintf(line, sizeof(line), "Len:%d", dacLen);
+  snprintf(line, sizeof(line), "Len:%d", (int)playLen);
   ssd1306_WriteString(line, Font_7x10, White);
 
   ssd1306_SetCursor(0, 48);
-  snprintf(line, sizeof(line), "%s", rd_solver_name());
+  snprintf(line, sizeof(line), "Blk:%lu %s",
+		  (unsigned long)blocks_built,
+		  rd_solver_name());
   ssd1306_WriteString(line, Font_7x10, White);
 
   ssd1306_UpdateScreen();
@@ -234,6 +250,41 @@ static void oled_show_error(const char *msg)
   ssd1306_UpdateScreen();
 }
 
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    if ((playBuf != NULL) && (playLen > 0))
+    {
+      if (HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, playBuf[playIndex]) != HAL_OK) {
+        Error_Handler();
+      }
+
+      playIndex++;
+      if (playIndex >= playLen) {
+        playIndex = 0;
+        block_wrap_flag = true;
+
+        if (swap_pending) {
+          uint16_t *oldPlay = (uint16_t *)playBuf;
+          int oldLen = playLen;
+
+          playBuf = buildBuf;
+          playLen = buildLen;
+
+          buildBuf = oldPlay;
+          buildLen = oldLen;
+
+          swap_pending = false;
+          build_request_flag = true;
+        } else {
+          underrun_flag = true;
+        }
+      }
+    }
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -246,30 +297,17 @@ int main(void)
   char line[32];
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
   MX_DAC1_Init();
   MX_I2C1_Init();
+  MX_TIM6_Init();
 
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
-  SystemCoreClockUpdate();
-  dwt_delay_init();
   ssd1306_Init();
 
   ssd1306_Fill(Black);
@@ -285,12 +323,38 @@ int main(void)
     Error_Handler();
   }
 
-  uint32_t t0 = HAL_GetTick();
-  if (!build_dac_block()) {
-    oled_show_error("Build failed");
+  bufA = (uint16_t*)malloc(RD_BLOCK_MAX_SAMPLES * sizeof(uint16_t));
+  bufB = (uint16_t*)malloc(RD_BLOCK_MAX_SAMPLES * sizeof(uint16_t));
+  if ((bufA == NULL) || (bufB == NULL)) {
+    oled_show_error("Buf alloc fail");
     Error_Handler();
   }
+
+  uint32_t t0 = HAL_GetTick();
+
+  int firstLen = 0;
+
+  if (!build_block_into_buffer(bufA, RD_BLOCK_MAX_SAMPLES, &firstLen)) {
+    oled_show_error("Build A fail");
+    Error_Handler();
+  }
+  playLen = firstLen;
+
+  if (!build_block_into_buffer(bufB, RD_BLOCK_MAX_SAMPLES, &buildLen)) {
+    oled_show_error("Build B fail");
+    Error_Handler();
+  }
+
   build_time_ms = HAL_GetTick() - t0;
+  blocks_built = 2;
+
+  playBuf = bufA;
+  buildBuf = bufB;
+  playIndex = 0;
+  swap_pending = true;
+  build_request_flag = false;
+  block_wrap_flag = false;
+  underrun_flag = false;
 
   oled_show_build_info();
 
@@ -306,49 +370,71 @@ int main(void)
 
   refDacCode = rd_mv_to_dac(0.0f);
 
-  /* DAC1 CH1 = PA4 = reference */
   if (HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, refDacCode) != HAL_OK) {
     oled_show_error("Set DAC ref fail");
     Error_Handler();
   }
 
-  /* DAC1 CH2 = PA5 = signal */
-  if (HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, dacBuf[0]) != HAL_OK) {
+  if (HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, playBuf[0]) != HAL_OK) {
     oled_show_error("Set DAC sig fail");
     Error_Handler();
   }
 
-  last_sample_us = micros_dwt();
+  if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK) {
+    oled_show_error("TIM6 start fail");
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  const uint32_t period_us = (uint32_t)lroundf(1000000.0f / params.ecg_fs);
-
   while (1)
   {
-    if ((uint32_t)(micros_dwt() - last_sample_us) >= period_us)
-    {
-      last_sample_us += period_us;
+    bool do_wrap = false;
+    bool do_build = false;
+    bool do_underrun = false;
 
-      if (HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, dacBuf[playIndex]) != HAL_OK) {
-        oled_show_error("DAC update fail");
+    __disable_irq();
+    do_wrap = block_wrap_flag;
+    block_wrap_flag = false;
+
+    do_build = build_request_flag && !swap_pending;
+    if (do_build) {
+      build_request_flag = false;
+    }
+
+    do_underrun = underrun_flag;
+    underrun_flag = false;
+    __enable_irq();
+
+    if (do_wrap)
+    {
+      last_adc_sig  = (int)read_adc_channel(ADC_CHANNEL_1);
+      last_adc_ref  = (int)read_adc_channel(ADC_CHANNEL_2);
+      last_adc_diff = last_adc_sig - last_adc_ref;
+    }
+
+    if (do_build)
+    {
+      if (!build_block_into_buffer(buildBuf, RD_BLOCK_MAX_SAMPLES, &buildLen)) {
+        oled_show_error("Rebuild fail");
         Error_Handler();
       }
 
-      for (volatile int k = 0; k < 200; k++) { __NOP(); }
+      blocks_built++;
 
-      last_adc_sig  = (int)read_adc_channel(ADC_CHANNEL_1); /* PA0 / ADC1_INP1 */
-      last_adc_ref  = (int)read_adc_channel(ADC_CHANNEL_2); /* PA1 / ADC1_INP2 */
-      last_adc_diff = last_adc_sig - last_adc_ref;
+      __disable_irq();
+      swap_pending = true;
+      __enable_irq();
 
-      playIndex++;
-      if (playIndex >= dacLen) {
-        playIndex = 0;
-      }
+      oled_show_build_info();
+    }
+
+    if (do_underrun)
+    {
+      oled_show_error("UNDERRUN");
+      Error_Handler();
     }
   }
-  /* USER CODE END WHILE */
 }
 
 /**
@@ -399,13 +485,17 @@ void SystemClock_Config(void)
   __HAL_FLASH_SET_PROGRAM_DELAY(FLASH_PROGRAMMING_DELAY_2);
 }
 
-/* USER CODE BEGIN 4 */
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_ADC1_Init(void)
 {
   ADC_ChannelConfTypeDef sConfig = {0};
 
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
@@ -437,6 +527,11 @@ static void MX_ADC1_Init(void)
   }
 }
 
+/**
+  * @brief DAC1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_DAC1_Init(void)
 {
   DAC_ChannelConfTypeDef sConfig = {0};
@@ -452,7 +547,6 @@ static void MX_DAC1_Init(void)
   sConfig.DAC_SignedFormat = DISABLE;
   sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
   sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
-  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
   sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
   sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
   if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK)
@@ -460,16 +554,22 @@ static void MX_DAC1_Init(void)
     Error_Handler();
   }
 
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
   if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00707CBB;
+  hi2c1.Init.Timing = 0x60808CD3;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -493,19 +593,42 @@ static void MX_I2C1_Init(void)
   }
 }
 
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 249;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 4999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
-/* USER CODE END 4 */
 
 void Error_Handler(void)
 {

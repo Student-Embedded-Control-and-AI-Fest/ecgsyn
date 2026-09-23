@@ -1,6 +1,7 @@
 clear all; close all; clc;
 
 % --- Standard Paper Constants ---
+dt = 0.01;
 C = 1.35;
 beta = 4.0;
 % ECG Weights: Linear combination from Equation (4)
@@ -41,7 +42,10 @@ for i = 1:3
     ];
 
     % Solve the ODE system
-    [t, x_out] = ode15s(ode_fun, tspan, x0, options);
+    %[t, x_out] = ode45(ode_fun, tspan, x0, options);
+    [t, x_out] = rk4_fixed(ode_fun, tspan(1), tspan(2), x0, dt);
+    t = t';
+    x_out = x_out';
 
     % 3. Apply Equation (4): Linear mixture of the four components
     ECG = alpha(1)*x_out(:,1) + alpha(2)*x_out(:,2) + alpha(3)*x_out(:,3) + alpha(4)*x_out(:,4);
@@ -50,15 +54,15 @@ for i = 1:3
     subplot(3, 1, subplot_order(i));
 
     % Zoom tightly into the steady state (Showing only ~5 seconds)
-    idx_zoom = find(t > 195 & t < 200); % Matches paper x-axis exactly
+    idx_zoom = find(t > 20 & t < 27); % Matches paper x-axis exactly
 
     % Plot with a thin line as in the paper
-    plot(t(idx_zoom), ECG(idx_zoom), 'k', 'LineWidth', 2.0);
-
-    % Annotation and Labeling
-    axis tight;
-    title(['Figure 4', panels{i}, ' - ', titles{i}, ' (H = ', num2str(H), ')']);
-    ylabel('\xi(t) [ECG]');
+    plot(t(:), ECG(:), 'k', 'LineWidth', 2.0);
+    xlim([25 40])
+    ylim([-1 1])    % Annotation and Labeling
+    %axis tight;
+    title([titles{i}]);
+    ylabel('ECG(t)');
     grid on;
     if i == 3; xlabel('Time (t)'); end
 end

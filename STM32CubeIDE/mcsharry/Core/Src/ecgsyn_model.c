@@ -7,8 +7,6 @@
 #define PI_D 3.1415926535897932384626433832795
 #endif
 
-#define USE_TUSTIN
-//#define USE_RK4
 
 static EcgSynContext* g_ctx = NULL;
 
@@ -242,9 +240,20 @@ static inline bool rrprocess(
 // ------------------------------------------------------------
 // ODE pieces
 // ------------------------------------------------------------
-static inline float angfreq(float t) {
-  int i = 1 + (int)floorf(t / g_ctx->h);
-  return 2.0 * PI_D / g_ctx->rrpc[i];
+static inline float angfreq(float t)
+{
+  int i;
+
+  if (g_ctx == NULL || g_ctx->rrpc == NULL || g_ctx->rrpc_len <= 0 || g_ctx->h <= 0.0f) {
+    return 2.0f * PI_D;  // safe fallback
+  }
+
+  i = 1 + (int)floorf(t / g_ctx->h);
+
+  if (i < 1) i = 1;
+  if (i > g_ctx->rrpc_len) i = g_ctx->rrpc_len;
+
+  return 2.0f * PI_D / g_ctx->rrpc[i];
 }
 
 static inline void derivspqrst(float t0, float x[], float dxdt[]) {
@@ -310,7 +319,10 @@ bool build_block_mv(
     const EcgSynParams *p,
     float **out_mv,
     int *out_len,
-    EcgSynContext *ctx)
+    EcgSynContext *ctx,
+    float *x_end,
+    float *y_end,
+    float *z_end)
 {
     *out_mv = NULL;
     *out_len = 0;
@@ -362,6 +374,8 @@ bool build_block_mv(
 
     ctx->rrpc = mallocVect(1, Nt);
     if (!ctx->rrpc) return false;
+
+    ctx->rrpc_len = Nt;
 
     tecg = 0.0f;
     int sample_idx = 1;
@@ -443,6 +457,18 @@ bool build_block_mv(
         (*out_mv)[j++] = z;
     }
 
+    if (!isfinite(x[1]) || !isfinite(x[2]) || !isfinite(x[3])) {
+        freeVect(zt, 1, Nt);
+        free(*out_mv);
+        *out_mv = NULL;
+        *out_len = 0;
+        return false;
+    }
+
+    if (x_end) *x_end = x[1];
+    if (y_end) *y_end = x[2];
+    if (z_end) *z_end = x[3];
+
     freeVect(zt, 1, Nt);
     return true;
 }
@@ -459,6 +485,8 @@ void free_context(EcgSynContext *ctx)
         freeVect(ctx->rrpc, 1, 1);
         ctx->rrpc = NULL;
     }
+
+    ctx->rrpc_len = 0;
 }
 
 void ecgsyn_init_default_params(EcgSynParams *p)
@@ -496,6 +524,7 @@ void ecgsyn_init_context(EcgSynContext *ctx)
 
     ctx->rr    = NULL;
     ctx->rrpc  = NULL;
+    ctx->rrpc_len = 0;
 
     for (int i = 0; i < 6; i++) {
         ctx->ti[i] = 0.0f;
@@ -648,9 +677,9 @@ static inline bool solve3x3(float A[4][4], float b[4], float x[4])
     return true;
 }
 
-static inline bool implicit_tustin_step(float y[], float t0, float h, float yout[])
+bool implicit_tustin_step(float y[], float t0, float h, float yout[])
 {
-    const int max_iter = 6;
+    const int max_iter = 10;
     const float tol = 1e-6f;
 
     float fp[4], fn[4];
@@ -663,7 +692,7 @@ static inline bool implicit_tustin_step(float y[], float t0, float h, float yout
 
     ecgsyn_rhs(t0, y, fp);
 
-    // initial guess: previous state
+    /* Better initial guess: previous state */
     for (int i = 1; i <= 3; i++) {
         xn[i] = y[i];
     }
@@ -671,6 +700,12 @@ static inline bool implicit_tustin_step(float y[], float t0, float h, float yout
     for (int iter = 0; iter < max_iter; iter++) {
         ecgsyn_rhs(t0 + h, xn, fn);
         ecgsyn_jacobian(t0 + h, xn, Jf);
+
+        for (int i = 1; i <= 3; i++) {
+            if (!isfinite(fn[i]) || !isfinite(xn[i])) {
+                return false;
+            }
+        }
 
         for (int i = 1; i <= 3; i++) {
             R[i] = xn[i] - y[i] - 0.5f * h * (fn[i] + fp[i]);
@@ -695,17 +730,23 @@ static inline bool implicit_tustin_step(float y[], float t0, float h, float yout
         float err = 0.0f;
         for (int i = 1; i <= 3; i++) {
             xn[i] += dx[i];
+
+            if (!isfinite(xn[i])) {
+                return false;
+            }
+
             float adx = fabsf(dx[i]);
             if (adx > err) err = adx;
         }
 
         if (err < tol) {
-            for (int i = 1; i <= 3; i++) yout[i] = xn[i];
+            for (int i = 1; i <= 3; i++) {
+                yout[i] = xn[i];
+            }
             return true;
         }
     }
 
-    // still return the last Newton iterate
-    for (int i = 1; i <= 3; i++) yout[i] = xn[i];
-    return true;
+    /* Do NOT silently accept a non-converged iterate */
+    return false;
 }
